@@ -1,0 +1,27 @@
+# 虚拟环境
+.venv/
+.venv*/
+env/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 配置与密钥
+.env
+vision_config.json
+
+# 运行时数据
+data/
+archive/
+logs/
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
