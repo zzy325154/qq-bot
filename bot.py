@@ -13,7 +13,9 @@ from typing import Any
 from urllib.parse import unquote
 
 import bedtime
+import coldwar
 import httpx
+import notify
 import pacing
 import together
 from avatar import fetch_avatar
@@ -39,7 +41,7 @@ from humanness import make_typo
 from longterm import ChatLog, NoteStore, format_notes, summarize_pending
 from memory import ChatMemory, annotate, strip_stamp
 from onebot import NotConnected, OneBotClient, OneBotError
-from relationship import Relationship
+from relationship import COLD_WORDS, CONFESS_WORDS, Relationship
 from recover import pick_missed
 from vision import VisionClient, VisionError
 from weather import fetch_weather
@@ -74,7 +76,8 @@ HELP_TEXT = """可用指令：
 /voice list 查看音色
 /voice all 全部音色各发一条
 /voice 晓伊 切换音色
-/relationship 查看关系状态
+/关系 查看关系状态
+/冷战 查看是不是在冷战
 /relationship reset 重置关系
 /生活 查看她现在的状态
 /头像 她自己挑一张头像换上
@@ -84,9 +87,9 @@ HELP_TEXT = """可用指令：
 其余消息会直接和我聊天。"""
 
 GREETING_PROMPTS = {
-    "morning": "现在是早上。用你平时说话的口吻，主动给主人发一条不超过 15 字的早安消息，可以带 [表情]。只输出消息正文。",
+    "morning": "现在是早上。用你平时说话的口吻，主动给浅井昭星发一条不超过 15 字的早安消息，可以带 [表情]。只输出消息正文。",
     "night": (
-        "现在是深夜，你准备睡了。用你平时说话的口吻，主动给主人发一条睡前消息，"
+        "现在是深夜，你准备睡了。用你平时说话的口吻，主动给浅井昭星发一条睡前消息，"
         "不超过 30 字、1-2 句。要有晚安的意思（提到要睡了、让他早点睡、困了之类），"
         "但不要只说“晚安”“睡了”这两个字：可以带一点今天的情绪、撒个娇、抱怨一句或者开个玩笑。"
         "下面如果给了最近的聊天内容，只当参考，别照抄也别每次都提同一件事。"
@@ -135,6 +138,38 @@ def is_flat_night_reply(text: str) -> bool:
 RECALL_RE = re.compile(r"记得|上次|之前|那次|以前|什么时候|哪天|我们")
 TYPO_RATE = 0.05
 QUOTE_RATE = 0.3
+
+# (离开时说的话, 回来可能说的话, 最短分钟, 最长分钟)
+AWAY_SCENES = (
+    ("我去洗个澡 一会儿再说", ("洗完啦 头发还湿着", "洗完了 舒服"), 20, 45),
+    ("室友叫我帮个忙 等我一下", ("弄完了 累死", "回来了 刚搬完东西手酸"), 10, 30),
+    ("我先下去拿个外卖", ("拿到了 上来吃", "刚上来 差点凉了"), 8, 20),
+    ("我妈打电话来了", ("讲完了 又被念一顿", "回来了 我妈就问我吃饭没"), 10, 25),
+    ("我去趟厕所", ("回来了", "我回来了 手机忘拿了"), 5, 12),
+)
+
+CONFESS_PROMPT = (
+    "# 他刚刚跟你表白了（内部设定）\n"
+    "你心里其实是高兴的，但别立刻扑上去。可以矜持一下、问一句「你认真的？」，"
+    "然后答应他。话别太长，别像念稿，也别突然变成另一个人。"
+)
+
+ACCEPT_WORDS = ("在一起", "愿意", "喜欢你", "喜欢啊", "做我女朋友", "可以啊", "好啊", "嗯好")
+REFUSE_WORDS = ("算了", "不了", "不要", "再等等", "没想过", "还是朋友", "不想")
+HER_CONFESS_ACCEPTED = (
+    "# 他刚答应了你的表白（内部设定）\n"
+    "你心里一下子松了，但嘴上还想别扭一下，可以吐槽他反应慢，"
+    "然后自然一点，别突然变成很甜的语气。"
+)
+HER_CONFESS_WAITING = (
+    "# 你刚跟他把话说开了（内部设定）\n"
+    "你已经问过你们算什么 / 说想在一起了，正等他的回答。"
+    "这轮别催得太紧，也别自己先把话收回去，语气可以有点紧张。"
+)
+HER_CONFESS_REJECTED = (
+    "# 他刚才躲开了你的话（内部设定）\n"
+    "你有点难受，但不想表现得太明显。回复短一点，别追问，也别装没事说一堆。"
+)
 
 TOOL_HINT = (
     "你可以使用 web_search 和 fetch_url 查询实时信息。"
@@ -375,11 +410,47 @@ class BotApp:
 
     def system_prompt(self) -> str:
         habits = self.habits.text()
-        return f"{self.persona}\n\n{habits}" if habits else self.persona
+        base = f"{self.persona}\n\n{habits}" if habits else self.persona
+        city = (self.cfg.weather_city or "").strip()
+        if city:
+            base += (
+                f"\n\n# 你在哪（内部设定，不用刻意提）\n"
+                f"你住在{city}，和浅井昭星在同一个城市，"
+                f"平时出门逛也就是在{city}，天气就是{city}的天气。"
+            )
+        school = (self.cfg.school_name or "").strip()
+        if school:
+            major = (self.cfg.major or "").strip()
+            major_text = f"，{major}专业" if major else ""
+            base += (
+                "\n\n# 你的学校（内部设定，不用刻意提）\n"
+                f"你在{school}读本科{major_text}，是专升本考上去的。\n"
+                "平时上课住校，住宿舍（有舍友），晚上也在宿舍；"
+                "只有放寒暑假才回家住，那会儿不用上课。"
+            )
+        return base
 
     async def start(self) -> None:
         self.scheduler.start()
         self._schedule_greeting("morning", self.cfg.morning_time)
+        self.scheduler.add_job(
+            self.check_connection,
+            IntervalTrigger(minutes=1),
+            id="connection-watch",
+            replace_existing=True,
+        )
+        self.scheduler.add_job(
+            self.check_away,
+            IntervalTrigger(minutes=1),
+            id="away-watch",
+            replace_existing=True,
+        )
+        self.scheduler.add_job(
+            self.check_cold_war,
+            IntervalTrigger(minutes=1),
+            id="cold-war-watch",
+            replace_existing=True,
+        )
         if self.cfg.night_dynamic and self.cfg.night_time.strip():
             self.scheduler.add_job(
                 self.check_bedtime,
@@ -629,6 +700,10 @@ class BotApp:
 
     async def _process_message(self, text: str, force: bool = False) -> None:
         now = datetime.now(TZ)
+        if self._away_until() is not None:
+            self.state.set("away_until", "")
+            self.state.set("away_return", "")
+            logger.info("她说要离开，但你来消息了，直接回来聊")
         previous = self._parse_dt(self.state.get("last_user_at"))
         silence_hours = (
             (now - previous).total_seconds() / 3600 if previous is not None else 0.0
@@ -646,8 +721,45 @@ class BotApp:
             self.state.set("mood_updated_at", now.isoformat())
         self.state.set("last_user_at", now.isoformat())
 
+        if self.cold_war_active() and coldwar.is_apology(text):
+            self.end_cold_war(soothe=True)
+            self._cold_softened = True
+            logger.info("他在哄人，冷战到此为止")
+
+        her_until = self._her_confess_until()
+        if her_until is not None:
+            if now >= her_until:
+                self.state.set("her_confess_until", "")
+            elif any(word in text for word in ACCEPT_WORDS):
+                self.state.set("her_confess_until", "")
+                if self.relationship.confess():
+                    self._her_confess_ok = True
+                    logger.info("他答应了她的表白")
+            elif any(word in text for word in REFUSE_WORDS):
+                self.state.set("her_confess_until", "")
+                self.relationship.reject(3)
+                self._her_confess_refused = True
+                logger.info("他躲开了她的表白")
+
         if self.cfg.relationship_enabled:
-            gained = self.relationship.observe(text, now.date())
+            last_bot = self._parse_dt(self.state.get("last_bot_at"))
+            gap_hours = (
+                (now - last_bot).total_seconds() / 3600 if last_bot is not None else 0.0
+            )
+            gained = self.relationship.observe(
+                text,
+                now.date(),
+                gap_hours=gap_hours,
+                low_content=pacing.is_low_content(text),
+            )
+            if self.relationship.is_couple:
+                if any(word in text for word in COLD_WORDS):
+                    self.start_cold_war(2)
+                elif pacing.is_low_content(text) and self.relationship.low_streak == 0:
+                    self.start_cold_war(1)
+            if any(word in text for word in CONFESS_WORDS) and self.relationship.can_confess():
+                self.relationship.confess()
+                self._just_confessed = True
             if gained:
                 logger.debug(
                     "好感 %+d（当前 %s/100）", gained, self.relationship.points
@@ -676,9 +788,22 @@ class BotApp:
                 logger.info("检测到唤醒词，结束安静时段")
             self.state.set("quiet_until", "")
 
+        follow_up = 0
+        for item in reversed(self.memory.history(self.cfg.owner_qq)):
+            if item.get("role") != "user":
+                break
+            follow_up += 1
+        chatting = previous is not None and (now - previous) <= timedelta(minutes=3)
+
         topic_until = self._parse_dt(self.state.get("topic_quiet_until"))
         if topic_until is not None:
-            if now < topic_until and not pacing.starts_new_topic(text):
+            if now < topic_until and not (
+                force
+                or follow_up
+                or chatting
+                or pacing.starts_new_topic(text)
+                or pacing.is_question(text)
+            ):
                 logger.info(
                     "话题已结束，安静至 %s，跳过回复",
                     topic_until.strftime("%m-%d %H:%M"),
@@ -701,6 +826,7 @@ class BotApp:
         if (
             not goodnight
             and not force
+            and not follow_up
             and pacing.should_skip(
                 text, mood_level, max(0.0, self.cfg.reply_chance - skip_bonus)
             )
@@ -714,6 +840,8 @@ class BotApp:
         )
         if delay_extra_max > 0:
             delay += random.uniform(delay_extra_min, delay_extra_max)
+        if self.cold_war_active():
+            delay += random.uniform(30, 120)
         logger.info("收到 %s（延迟 %.1fs 回复）", text[:80], delay)
         await asyncio.sleep(delay)
         reply = await self.chat_reply(self.cfg.owner_qq, text, mood_level=mood_level)
@@ -731,6 +859,8 @@ class BotApp:
             or pacing.is_goodnight(user_text)
             or pacing.is_ack(user_text)
         ):
+            return
+        if len(user_text.strip()) > 12 or pacing.is_question(user_text):
             return
         prompt = f"""判断这轮对话是否已经自然结束：对方只是收尾、确认或告别，不需要再接话。
 用户：{user_text}
@@ -885,6 +1015,17 @@ class BotApp:
             await self.send(user_id, self.relationship.status_text())
             return True
 
+        if command in ("coldwar", "冷战"):
+            until = self._cold_war_until()
+            if until is not None and self.cold_war_active():
+                await self.send(user_id, f"正在冷战，到 {until:%H:%M} 结束。")
+            else:
+                await self.send(
+                    user_id,
+                    "现在没在冷战。她在情侣阶段被说冷话、或连着敷衍三次才会开始。",
+                )
+            return True
+
         if command in ("life", "生活"):
             daily = self.daily_context()
             text = self.life.status_text()
@@ -988,11 +1129,7 @@ class BotApp:
         )
 
     async def handle_emoji_command(self, user_id: int, action: str) -> None:
-        try:
-            from archive.fetch_emojis import fetch_and_approve
-        except ImportError:
-            await self.send(user_id, "表情抓取模块未安装。")
-            return
+        from archive.fetch_emojis import fetch_and_approve
 
         await self.send(user_id, "我自己挑几张，稍等。")
         try:
@@ -1026,6 +1163,22 @@ class BotApp:
         self, user_id: int, text: str, mood_level: int = 0
     ) -> str | None:
         messages = self.memory.build_messages(user_id, self.system_prompt(), text)
+        if self.cold_war_active():
+            messages.insert(1, {"role": "system", "content": coldwar.COLD_PROMPT})
+        elif getattr(self, "_cold_softened", False):
+            self._cold_softened = False
+            messages.insert(1, {"role": "system", "content": coldwar.SOFT_PROMPT})
+        if getattr(self, "_just_confessed", False):
+            self._just_confessed = False
+            messages.insert(1, {"role": "system", "content": CONFESS_PROMPT})
+        if getattr(self, "_her_confess_ok", False):
+            self._her_confess_ok = False
+            messages.insert(1, {"role": "system", "content": HER_CONFESS_ACCEPTED})
+        elif getattr(self, "_her_confess_refused", False):
+            self._her_confess_refused = False
+            messages.insert(1, {"role": "system", "content": HER_CONFESS_REJECTED})
+        elif self._her_confess_pending():
+            messages.insert(1, {"role": "system", "content": HER_CONFESS_WAITING})
         if self.cfg.mood_enabled and mood_level > 0:
             label, hint = mood_by_level(mood_level)
             if hint:
@@ -1077,12 +1230,15 @@ class BotApp:
                 logger.warning("聊天检索失败: %s", exc)
                 hits = []
             if hits:
-                recall = "\n---\n".join(h["text"][:500] for h in hits)
+                recall = "\n---\n".join(
+                    f"[{str(h.get('start', ''))[:10]}]\n{h['text'][:500]}" for h in hits
+                )
                 messages.insert(
                     1,
                     {
                         "role": "system",
-                        "content": "# 你们过去的相关聊天片段（仅供回忆参考，不要逐字复述）\n" + recall,
+                        "content": "# 你们过去的相关聊天片段（方括号是当时的日期，全是过去的事，"
+                        "不要当成现在的安排；仅供回忆参考，不要逐字复述）\n" + recall,
                     },
                 )
                 logger.info("检索到 %s 个相关片段", len(hits))
@@ -1157,6 +1313,8 @@ class BotApp:
         await self.send_voice(user_id, reply, mood_level=mood_level)
         if self.cfg.life_enabled:
             self._note_together(text, reply)
+        if self.cfg.away_enabled:
+            await self._maybe_leave()
         if self.cfg.commitments_enabled:
             asyncio.create_task(self._extract_commitment(text, reply))
         if self.cfg.mood_enabled and mood_level > 0:
@@ -1208,7 +1366,7 @@ class BotApp:
     @staticmethod
     def _clean_reply(text: str) -> str:
         text = strip_stamp(text)
-        text = re.sub(r"^(对方\.?|我)\s*[:：]\s*", "", text)
+        text = re.sub(r"^(没有答案\.?|我)\s*[:：]\s*", "", text)
         text = text.replace("**", "").replace("*", "")
         return text.strip().strip("\"“”'")
 
@@ -1543,6 +1701,149 @@ class BotApp:
             "不要问他在哪、到了没，也不用一直发消息。"
         )
 
+    def _her_confess_until(self) -> datetime | None:
+        return self._parse_dt(self.state.get("her_confess_until"))
+
+    def _her_confess_pending(self) -> bool:
+        until = self._her_confess_until()
+        return until is not None and datetime.now(TZ) < until
+
+    async def _send_her_confession(self, now: datetime) -> None:
+        prompt = (
+            "你憋了一阵子了。用你平时的语气主动问他一句关于你们关系的话："
+            "直接问「我们算什么」，或者问他是不是喜欢你，或者说想跟他在一起。"
+            "20 字以内，别太正式，别写小作文。只输出这句话。"
+        )
+        messages = [
+            {"role": "system", "content": self.system_prompt()},
+            {"role": "system", "content": "最近的对话：\n" + self._greeting_context()},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            text = await self.llm.chat(messages, temperature=1.0)
+        except LLMError as exc:
+            logger.warning("她主动表白生成失败: %s", exc)
+            return
+        text = strip_stamp(text).replace("\n", " ")[:80]
+        if not text:
+            return
+        await self.send(self.cfg.owner_qq, text, emoji=True)
+        self.memory.append(self.cfg.owner_qq, "assistant", text)
+        self.chat_log.append("assistant", text)
+        self.state.set(
+            "her_confess_until", (now + timedelta(hours=24)).isoformat()
+        )
+        self.state.set("last_idle_at", now.isoformat())
+        self._note_her_confession()
+        logger.info("她主动表白：%s", text)
+
+    def _note_her_confession(self) -> None:
+        if self.cfg.relationship_enabled:
+            self.relationship.observe_proactive(datetime.now(TZ).date())
+
+    def _cold_war_until(self) -> datetime | None:
+        return self._parse_dt(self.state.get("cold_war_until"))
+
+    def cold_war_active(self) -> bool:
+        until = self._cold_war_until()
+        return until is not None and datetime.now(TZ) < until
+
+    def start_cold_war(self, level: int = 1) -> None:
+        if not self.relationship.is_couple or self.cold_war_active():
+            return
+        now = datetime.now(TZ)
+        span = coldwar.COLD_LEVELS.get(level, coldwar.COLD_LEVELS[1])
+        self.state.set("cold_war_until", (now + span).isoformat())
+        self.state.set("cold_war_level", level)
+        logger.info("进入冷战：等级 %s，到 %s 结束", level, (now + span).strftime("%H:%M"))
+
+    def end_cold_war(self, soothe: bool = False) -> None:
+        self.state.set("cold_war_until", "")
+        self.state.set("cold_war_level", 0)
+        if soothe:
+            self.relationship.soothe(2)
+        logger.info("冷战结束")
+
+    async def check_cold_war(self) -> None:
+        until = self._cold_war_until()
+        if until is None:
+            return
+        if not self.relationship.is_couple:
+            self.end_cold_war()
+            return
+        if datetime.now(TZ) < until:
+            return
+        self.end_cold_war()
+        text = random.choice(coldwar.END_LINES)
+        self.memory.append(self.cfg.owner_qq, "assistant", text)
+        self.chat_log.append("assistant", text)
+        await self.send(self.cfg.owner_qq, text)
+        logger.info("冷战到点结束：%s", text)
+
+    def _away_until(self) -> datetime | None:
+        return self._parse_dt(self.state.get("away_until"))
+
+    async def _maybe_leave(self) -> None:
+        """聊到一半，她偶尔会真的去忙一件小事，过一阵再回来。"""
+        if not self.cfg.away_enabled or self._away_until() is not None:
+            return
+        if self.cold_war_active():
+            return
+        if self._meeting_until() is not None:
+            return
+        if self._parse_dt(self.state.get("quiet_until")):
+            return
+        if not self.life.reply_profile()[3]:
+            return
+        if random.random() >= self.cfg.away_chance:
+            return
+        line, returns, low, high = random.choice(AWAY_SCENES)
+        now = datetime.now(TZ)
+        until = now + timedelta(minutes=random.uniform(low, high))
+        self.state.set("away_until", until.isoformat())
+        self.state.set("away_return", random.choice(returns))
+        self.memory.append(self.cfg.owner_qq, "assistant", line)
+        self.chat_log.append("assistant", line)
+        await self.send(self.cfg.owner_qq, line)
+        logger.info("她离开一下：%s（%s 回来）", line, until.strftime("%H:%M"))
+
+    async def check_away(self) -> None:
+        until = self._away_until()
+        if until is None:
+            return
+        now = datetime.now(TZ)
+        if now < until:
+            return
+        text = self.state.get("away_return") or "我回来了"
+        self.state.set("away_until", "")
+        self.state.set("away_return", "")
+        self.life.add_event(text, now, ttl_hours=6)
+        self.memory.append(self.cfg.owner_qq, "assistant", text)
+        self.chat_log.append("assistant", text)
+        await self.send(self.cfg.owner_qq, text)
+        logger.info("她回来了：%s", text)
+
+    async def check_connection(self) -> None:
+        """连不上 NapCat 太久就弹桌面通知，恢复时再通知一次。"""
+        now = datetime.now(TZ)
+        if self.client.connected:
+            if self.state.get("conn_alerted"):
+                self.state.set("conn_alerted", "")
+                notify.toast("QQ 机器人", "已经重新连上 NapCat")
+                logger.info("断线恢复，已发通知")
+            self.state.set("conn_ok_at", now.isoformat())
+            return
+        last = self._parse_dt(self.state.get("conn_ok_at")) or now
+        minutes = (now - last).total_seconds() / 60
+        if minutes < self.cfg.disconnect_alert_minutes or self.state.get("conn_alerted"):
+            return
+        self.state.set("conn_alerted", now.isoformat())
+        notify.toast(
+            "QQ 机器人掉线",
+            f"已经 {minutes:.0f} 分钟连不上 NapCat（3001 端口），可能要重新登录",
+        )
+        logger.warning("断线 %.0f 分钟，已发桌面通知", minutes)
+
     async def check_bedtime(self) -> None:
         now = datetime.now(TZ)
         last = self._parse_dt(self.state.get("night_sent_at"))
@@ -1653,7 +1954,8 @@ class BotApp:
         prompt = f"""你在过自己的日子。现在是 {now:%m-%d %H:%M}，你{self.life.activity}。
 写一件刚刚或今天发生的小事，20 字以内，要具体、生活化，像随手记下来的。
 不要和最近发生过的事重复：{recent}
-只输出这件事本身，不要前缀和解释。"""
+格式固定为「心情|这件事」，心情只能从 爽 烦 累 无语 开心 慌 里选一个。
+只输出这一行，不要前缀和解释。"""
         try:
             text = await self.llm.chat(
                 [
@@ -1665,12 +1967,18 @@ class BotApp:
         except LLMError as exc:
             logger.debug("生成生活小事失败: %s", exc)
             return
-        text = text.strip().splitlines()[0][:60] if text.strip() else ""
-        if text and self.life.add_event(text, now):
-            logger.info("生活小事：%s", text)
+        line = text.strip().splitlines()[0].strip() if text.strip() else ""
+        mood = ""
+        if "|" in line:
+            head, rest = line.split("|", 1)
+            if head.strip() in life.MOODS:
+                mood, line = head.strip(), rest.strip()
+        line = line[:60]
+        if line and self.life.add_event(line, now, mood=mood):
+            logger.info("生活小事：%s（心情 %s）", line, mood or "无")
 
     async def maybe_idle_chat(self) -> None:
-        if self.idle_window is None:
+        if self.idle_window is None or self.cold_war_active():
             return
         now = datetime.now(TZ)
         last_user = self._parse_dt(self.state.get("last_user_at"))
@@ -1714,12 +2022,20 @@ class BotApp:
         return random.choice(candidates) if candidates else None
 
     async def _send_idle_message(self, now: datetime, last_user: datetime) -> None:
+        if (
+            self.cfg.relationship_enabled
+            and self.relationship.can_confess()
+            and not self._her_confess_pending()
+            and random.random() < self.cfg.her_confess_chance
+        ):
+            await self._send_her_confession(now)
+            return
         recent = self.state.get("recent_idle", [])
         recent_text = "\n".join(f"- {text}" for text in recent[-5:]) or "（无）"
         history = self.memory.history(self.cfg.owner_qq)[-6:]
         history_text = (
             "\n".join(
-                f"{'你' if item['role'] == 'assistant' else '主人'}: {annotate(item)[:80]}"
+                f"{'你' if item['role'] == 'assistant' else '浅井昭星'}: {annotate(item)[:80]}"
                 for item in history
             )
             or "（无）"
@@ -1744,7 +2060,7 @@ class BotApp:
             focus = f"问问之前这件事后来怎么样了：{str(thread.get('text', ''))[:40]}"
         else:
             focus = random.choice(IDLE_ANGLES)
-        instruction = f"""现在是 {now:%H:%M}，你和主人已经 {hours:.1f} 小时没说话了。
+        instruction = f"""现在是 {now:%H:%M}，你和浅井昭星已经 {hours:.1f} 小时没说话了。
 {mood_line}
 以你的身份主动发一条消息，像突然想起他一样。
 这次的重点是：{focus}。
@@ -1782,10 +2098,8 @@ class BotApp:
             used_threads = (self.state.get("recent_threads") or [])[-9:]
             used_threads.append(thread.get("id"))
             self.state.set("recent_threads", used_threads)
-        if self.cfg.relationship_enabled and self.relationship.observe_proactive(
-            now.date()
-        ):
-            logger.debug("主动搭话，好感 +1（%s/100）", self.relationship.points)
+        if self.cfg.relationship_enabled:
+            self.relationship.observe_proactive(now.date())
 
     # ---------- 主动消息 ----------
 
@@ -1823,6 +2137,9 @@ class BotApp:
         return "\n".join(parts)
 
     async def send_greeting(self, kind: str) -> None:
+        if self.cold_war_active():
+            logger.info("冷战期间不发主动问候")
+            return
         prompt = GREETING_PROMPTS[kind]
         context = self._greeting_context()
         if context:
@@ -1874,10 +2191,8 @@ class BotApp:
         logger.info("发送主动问候(%s): %s", kind, text[:60].replace("\n", " "))
         await self.send(self.cfg.owner_qq, text, emoji=True)
         self.memory.append(self.cfg.owner_qq, "assistant", text)
-        if self.cfg.relationship_enabled and self.relationship.observe_proactive(
-            datetime.now(TZ).date()
-        ):
-            logger.debug("主动问候，好感 +1（%s/100）", self.relationship.points)
+        if self.cfg.relationship_enabled:
+            self.relationship.observe_proactive(datetime.now(TZ).date())
 
     def _restore_reminders(self) -> None:
         self.reminders.drop_expired()

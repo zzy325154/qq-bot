@@ -124,7 +124,7 @@ def test_reminders() -> None:
 def test_reply_formatting() -> None:
     from bot import BotApp
 
-    check("去掉角色前缀", BotApp._clean_reply("对方.：在啊") == "在啊")
+    check("去掉角色前缀", BotApp._clean_reply("没有答案.：在啊") == "在啊")
     bubbles = BotApp._split_bubbles("在啊\n干嘛\n[表情]")
     check("按行拆气泡", bubbles == ["在啊", "干嘛", "[表情]"])
     long_line = "今天真的超级无敌累" * 6
@@ -136,8 +136,8 @@ def test_reply_formatting() -> None:
 def test_emoji_filter() -> None:
     try:
         from archive.fetch_emojis import allowed_name
-    except ImportError:
-        return  # 表情抓取模块未包含在开源版中
+    except ImportError:  # 公开仓库不含 archive 模块
+        return
 
     check("普通表情名放行", allowed_name("猫和老鼠00093-疑问问号.jpg"))
     check("恋爱词被拦截", not allowed_name("亲亲抱抱.jpg"))
@@ -249,6 +249,7 @@ def test_longterm() -> None:
         store = NoteStore(Path(tmp) / "notes.json")
         added = store.add_many(["他下周要考试", "她喜欢猫"], "a", "b")
         check("记忆新增", added == 2)
+        check("重复记忆会被跳过", store.add_many(["他下周要考试啊"], "a", "b") == 0)
         check("记忆检索", any("考试" in n["text"] for n in store.search("考试")))
         reloaded = NoteStore(Path(tmp) / "notes.json")
         check("记忆持久化", len(reloaded.notes) == 2)
@@ -313,6 +314,19 @@ def test_pacing() -> None:
     check("唤醒词识别", pacing.is_wake("在吗"))
     check("好的啊不算收尾", not pacing.is_topic_end("好的啊") and pacing.is_ack("好的啊"))
     check("知道了算收尾", pacing.is_topic_end("知道了"))
+    check(
+        "问句算新话题",
+        pacing.starts_new_topic("那后来是让你妈拿的吗")
+        and pacing.starts_new_topic("为啥啊")
+        and not pacing.starts_new_topic("那你是真的忘性大"),
+    )
+    check(
+        "问句识别",
+        pacing.is_question("那后来是让你妈拿的吗")
+        and pacing.is_question("为啥啊")
+        and pacing.is_question("你几点回来？")
+        and not pacing.is_question("那你是真的忘性大"),
+    )
     check(
         "概率不回",
         pacing.should_skip("随便聊聊", 0, 0.9, rng=lambda: 0.95),
@@ -413,8 +427,8 @@ def test_voice_styles() -> None:
 def test_emoji_cute() -> None:
     try:
         from archive.fetch_emojis import tone_score
-    except ImportError:
-        return  # 表情抓取模块未包含在开源版中
+    except ImportError:  # 公开仓库不含 archive 模块
+        return
 
     check("可爱词加分", tone_score("超可爱猫咪") > tone_score("离谱沙雕"))
     check("丑图减分", tone_score("丑糊裂开") < tone_score("软萌小猫"))
@@ -545,16 +559,45 @@ def test_avatar() -> None:
 def test_life() -> None:
     from datetime import datetime, timedelta, timezone
 
-    from life import LifeState, activity_for_hour
+    from life import LifeState, activity_for_hour, vacation_on
 
     check("凌晨在睡觉", "睡" in activity_for_hour(3)[0])
     check("中午在吃午饭", "午饭" in activity_for_hour(13)[0])
     check("晚上在追剧", "追剧" in activity_for_hour(21)[0])
+    check("工作日九点在上课", "上课" in activity_for_hour(9)[0])
+    check("周末九点不上课", "上课" not in activity_for_hour(9, weekend=True)[0])
+    check("周末在家", "家" in activity_for_hour(13, weekend=True)[0])
+    from life import home_override
+
+    check(
+        "周五晚上回家",
+        "家" in home_override(datetime(2026, 11, 6, 19, 0)),
+    )
+    check(
+        "周日晚回宿舍",
+        "宿舍" in home_override(datetime(2026, 11, 8, 20, 30)),
+    )
+    check("周日深夜回到作息", home_override(datetime(2026, 11, 8, 23, 0)) == "")
+    check("暑假判定", vacation_on(datetime(2026, 8, 1).date()) == "暑假")
+    check("寒假判定", vacation_on(datetime(2026, 2, 1).date()) == "寒假")
+    check("平时不是假期", vacation_on(datetime(2026, 11, 9).date()) == "")
+    check("假期不上课", "上课" not in activity_for_hour(9, vacation="暑假")[0])
+
+    vac = LifeState(Path(tempfile.mkdtemp()) / "life.json")
+    vac.tick(datetime(2026, 8, 1, 9, 0))
+    check("假期会写进提示", "暑假" in vac.prompt(datetime(2026, 8, 1, 9, 0)))
+
+    moody = LifeState(Path(tempfile.mkdtemp()) / "life.json")
+    mood_at = datetime(2026, 11, 2, 9, 0)
+    moody.add_event("外卖又迟到半小时", mood_at, mood="烦")
+    check("心情会被记住", moody.latest_mood(mood_at) == "烦")
+    check("心情写进提示", "有点烦" in moody.prompt(mood_at))
+    check("心情会过期", moody.latest_mood(mood_at + timedelta(hours=8)) == "")
 
     tmp = Path(tempfile.mkdtemp()) / "life.json"
     life = LifeState(tmp)
     life.energy = 50
-    start = datetime(2026, 11, 1, 9, 0)
+    start = datetime(2026, 11, 2, 9, 0)
     life.tick(start)
     check("上午在忙事情", "上课" in life.activity)
     life.tick(start + timedelta(hours=1))
@@ -566,7 +609,7 @@ def test_life() -> None:
     life.tick(later)
     check("事件会过期", "踩到一滩水" not in life.prompt(later))
     check("状态文本可读", "她现在的状态" in life.status_text())
-    check("提示包含日期时间", "11-01 09:00" in life.prompt(start))
+    check("提示包含日期时间", "11-02 09:00" in life.prompt(start))
 
     dup = LifeState(Path(tempfile.mkdtemp()) / "life.json")
     first = dup.add_event("外卖到了懒得下楼", start)
@@ -587,6 +630,17 @@ def test_life() -> None:
         "带时区事件不报错",
         "时区测试" in aware.prompt(start),
     )
+
+    out = LifeState(Path(tempfile.mkdtemp()) / "life.json")
+    out.tick(start)
+    out.outing_place = "在商场里逛"
+    out.outing_until = (start + timedelta(hours=3)).isoformat()
+    out.tick(start + timedelta(minutes=30))
+    check("出门时状态会显示", "出门了" in out.activity)
+    check("出门时回得更慢", out.reply_profile()[0] >= 30)
+    out.tick(start + timedelta(hours=4))
+    check("回家后回到作息", "出门了" not in out.activity)
+    check("回家会记一条小事", any("到家" in text for text in out.recent_events(5)))
 
     profile = LifeState(Path(tempfile.mkdtemp()) / "life.json")
     profile.activity = "在睡觉"
@@ -609,7 +663,7 @@ def test_together() -> None:
     check(
         "答应陪玩会记下",
         together.detect("来陪我打王者", "行吧 上号") == (
-            "和主人一起打王者荣耀",
+            "和浅井昭星一起打王者荣耀",
             "和他一起打了两把王者荣耀",
         ),
     )
@@ -626,7 +680,7 @@ def test_together() -> None:
     life = LifeState(tmp)
     start = datetime(2026, 11, 5, 21, 0)
     life.tick(start)
-    life.set_activity("和主人一起打王者荣耀", start, hold_hours=2)
+    life.set_activity("和浅井昭星一起打王者荣耀", start, hold_hours=2)
     life.tick(start + timedelta(minutes=30))
     check("一起玩的状态会保持", "打王者" in life.activity)
     life.tick(start + timedelta(hours=3))
@@ -670,6 +724,93 @@ def test_relationship() -> None:
     check("关闭时状态显示已关闭", "已关闭" in off.status_text())
     check("关闭时不注入", off.prompt() == "")
 
+    one_side = Relationship(
+        Path(tempfile.mkdtemp()) / "rel.json",
+        daily_cap=6,
+        decay_per_day=4,
+        start_points=50,
+    )
+    one_side.observe("在吗", date(2026, 11, 10))
+    one_side.observe_proactive(date(2026, 11, 11))
+    points_before = one_side.points
+    one_side.refresh(date(2026, 11, 12))
+    check("只有她主动也照扣", one_side.points == points_before - 4)
+
+    pending = Relationship(
+        Path(tempfile.mkdtemp()) / "rel.json",
+        daily_cap=6,
+        decay_per_day=4,
+        start_points=50,
+    )
+    pending.observe_proactive(date(2026, 11, 10))
+    check("她主动先不计分", pending.points == 50)
+    base = pending.points
+    pending.observe("在", date(2026, 11, 10))
+    check("当天回了才补上她那份", pending.points == base + 3)
+
+    def fresh() -> Relationship:
+        rel = Relationship(
+            Path(tempfile.mkdtemp()) / "pen.json",
+            daily_cap=6,
+            decay_per_day=4,
+            start_points=50,
+        )
+        rel.last_message_date = date(2026, 11, 10)
+        rel.gain_date = "2026-11-10"
+        rel.penalty_date = "2026-11-10"
+        rel.today_gain = 0
+        return rel
+
+    low = fresh()
+    low.observe("嗯", date(2026, 11, 10), low_content=True)
+    check("敷衍扣 1 分", low.points == 50)
+
+    slow = fresh()
+    slow.observe("在", date(2026, 11, 10), gap_hours=5)
+    check("回得慢扣 1 分", slow.points == 50)
+    far = fresh()
+    far.observe("在", date(2026, 11, 10), gap_hours=20)
+    check("隔太久回复不算慢", far.points == 51)
+
+    streak_pen = fresh()
+    for _ in range(3):
+        streak_pen.observe("哦", date(2026, 11, 10), low_content=True)
+    check("连续敷衍额外扣 2 分", streak_pen.points == 48)
+
+    import coldwar
+
+    check("哄人识别", coldwar.is_apology("对不起 别生气了"))
+    check("普通话不算哄", not coldwar.is_apology("在干嘛"))
+    check("冷战二级更久", coldwar.COLD_LEVELS[2] > coldwar.COLD_LEVELS[1])
+
+    couple = Relationship(Path(tempfile.mkdtemp()) / "c.json", start_points=90)
+    couple.confess()
+    check("情侣阶段识别", couple.is_couple)
+    base_points = couple.points
+    couple.soothe(2)
+    check("哄好能回一点分", couple.points == base_points + 2)
+
+    undecided = Relationship(Path(tempfile.mkdtemp()) / "u.json", start_points=100)
+    check("好感满了也不能自动成情侣", undecided.stage == 3)
+    check("满好感可以表白", undecided.can_confess())
+    check("表白后进情侣", undecided.confess() and undecided.stage == 4)
+    check("不能重复表白", not undecided.can_confess())
+
+    rejected = Relationship(Path(tempfile.mkdtemp()) / "r2.json", start_points=100)
+    rejected.reject(3)
+    check("她开口被躲开会掉分", rejected.points == 97)
+
+    quiet = Relationship(
+        Path(tempfile.mkdtemp()) / "rel.json",
+        daily_cap=6,
+        decay_per_day=4,
+        start_points=50,
+    )
+    quiet.observe("在吗", date(2026, 11, 10))
+    quiet_before = quiet.points
+    quiet.refresh(date(2026, 11, 12))
+    check("真的一天没互动才会扣", quiet.points == quiet_before - 4)
+
     plain = Relationship(Path(tempfile.mkdtemp()) / "r.json")
     plain.observe("在吗", day)
     flirt = Relationship(Path(tempfile.mkdtemp()) / "r.json")
@@ -712,9 +853,10 @@ def test_relationship() -> None:
     check("冷话扣 6 分", cold.points == 34)
 
     proactive = Relationship(Path(tempfile.mkdtemp()) / "r.json", start_points=40)
-    check("主动消息加一点", proactive.observe_proactive(day) == 1)
-    check("主动加分每天一次", proactive.observe_proactive(day) == 0)
-    check("主动加分生效", proactive.points == 41)
+    check("她主动先挂起", proactive.observe_proactive(day) == 0)
+    check("没人回就先不加分", proactive.points == 40)
+    proactive.observe("在", day)
+    check("你回了才补上她那份", proactive.points == 43)
     check(
         "普通朋友主动概率更低",
         Relationship(Path(tempfile.mkdtemp()) / "l.json", start_points=0).idle_chance_factor()

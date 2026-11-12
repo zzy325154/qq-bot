@@ -1,3 +1,4 @@
+import contextlib
 import logging
 from typing import Any
 
@@ -15,7 +16,33 @@ class LLMClient:
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
         self.model = model
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0))
+        self._client = self._new_client()
+
+    def _new_client(self) -> httpx.AsyncClient:
+        # trust_env=False：不读系统代理。代理一关，读旧代理的请求会全部连不上。
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(90.0, connect=15.0), trust_env=False
+        )
+
+    async def _reset_client(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._client.aclose()
+        self._client = self._new_client()
+
+    async def _post(self, payload: dict[str, Any]) -> httpx.Response:
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        url = f"{self.api_base}/chat/completions"
+        try:
+            return await self._client.post(url, headers=headers, json=payload)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            logger.warning("模型连接失败，重建连接再试一次: %s", exc)
+            await self._reset_client()
+            try:
+                return await self._client.post(url, headers=headers, json=payload)
+            except httpx.HTTPError as retry_exc:
+                raise LLMError(f"请求失败: {retry_exc}") from retry_exc
+        except httpx.HTTPError as exc:
+            raise LLMError(f"请求失败: {exc}") from exc
 
     async def chat_message(
         self,
@@ -35,13 +62,9 @@ class LLMClient:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
         try:
-            resp = await self._client.post(
-                f"{self.api_base}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json=payload,
-            )
-        except httpx.HTTPError as exc:
-            raise LLMError(f"请求失败: {exc}") from exc
+            resp = await self._post(payload)
+        except LLMError:
+            raise
 
         if resp.status_code != 200:
             body = resp.text[:300].replace("\n", " ")

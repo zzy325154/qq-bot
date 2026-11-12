@@ -25,4 +25,4 @@ def detect(context: str, reply: str) -> tuple[str, str] | None:
     if not any(word in reply for word in AGREE_WORDS):
         return None
     label = "王者荣耀" if game == "王者" else game
-    return f"和主人一起打{label}", f"和他一起打了两把{label}"
+    return f"和浅井昭星一起打{label}", f"和他一起打了两把{label}"

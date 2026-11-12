@@ -13,7 +13,7 @@ TOPIC_END_PHRASES = {
 }
 NEW_TOPIC_MARKERS = (
     "？", "?", "对了", "还有", "顺便", "问你", "帮我", "那个", "在吗", "我想",
-    "能不能", "怎么样", "为什么", "怎么",
+    "能不能", "怎么样", "为什么", "怎么", "为啥", "吗", "呢", "是不是", "有没有",
 )
 TOPIC_END_LONG = ("先这样", "就这样", "没事了", "知道了", "明白了", "谢谢")
 ACK_ONLY = {"好的啊", "好啊", "好呀", "行啊", "可以啊", "好吧", "好滴", "嗯嗯", "哦哦"}
@@ -38,6 +38,20 @@ def is_wake(text: str) -> bool:
 
 def starts_new_topic(text: str) -> bool:
     return contains_any(text, NEW_TOPIC_MARKERS)
+
+
+QUESTION_WORDS = (
+    "为什么", "为啥", "怎么", "咋样", "是不是", "有没有", "几点", "多少", "哪", "什么",
+)
+
+
+def is_question(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return False
+    if compact.endswith(("？", "?", "吗", "呢", "嘛")):
+        return True
+    return contains_any(compact, QUESTION_WORDS)
 
 
 def is_topic_end(text: str) -> bool:

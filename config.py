@@ -116,6 +116,20 @@ class Config:
     idle_after_bot_hours: float = field(
         default_factory=lambda: _env_float("IDLE_AFTER_BOT_HOURS", 2.0)
     )
+    disconnect_alert_minutes: int = field(
+        default_factory=lambda: _env_int("DISCONNECT_ALERT_MINUTES", 10)
+    )
+    away_enabled: bool = field(
+        default_factory=lambda: _env_str("AWAY_ENABLED", "1") != "0"
+    )
+    away_chance: float = field(
+        default_factory=lambda: _env_float("AWAY_CHANCE", 0.06)
+    )
+    her_confess_chance: float = field(
+        default_factory=lambda: _env_float("HER_CONFESS_CHANCE", 0.12)
+    )
+    school_name: str = field(default_factory=lambda: _env_str("SCHOOL_NAME", ""))
+    major: str = field(default_factory=lambda: _env_str("MAJOR", ""))
     mood_enabled: bool = field(
         default_factory=lambda: _env_str("MOOD_ENABLED", "1") != "0"
     )
@@ -156,7 +170,7 @@ class Config:
         default_factory=lambda: _env_float("QUIET_HOURS", 8.0)
     )
     topic_quiet_minutes: float = field(
-        default_factory=lambda: _env_float("TOPIC_QUIET_MINUTES", 20.0)
+        default_factory=lambda: _env_float("TOPIC_QUIET_MINUTES", 8.0)
     )
     topic_judge_enabled: bool = field(
         default_factory=lambda: _env_str("TOPIC_JUDGE_ENABLED", "1") != "0"

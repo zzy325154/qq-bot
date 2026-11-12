@@ -2,7 +2,6 @@ import base64
 import io
 import json
 import logging
-import os
 from pathlib import Path
 
 import httpx
@@ -10,10 +9,7 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-VISION_CONFIG = Path(os.getenv(
-    "VISION_CONFIG",
-    str(Path(__file__).resolve().parent / "vision_config.json"),
-))
+VISION_CONFIG = Path(r"C:\Users\30540\vision-mcp\Vision-MCP\config.json")
 DEFAULT_PROMPT = "用 1-3 句话描述这张图片：主体、画面里的文字、情绪或梗。只描述，不评价。"
 
 

@@ -1,3 +1,4 @@
+import difflib
 import json
 import logging
 import os
@@ -86,12 +87,22 @@ class NoteStore:
         )
         os.replace(tmp, self.path)
 
+    def _too_similar(self, text: str, limit: float = 0.75) -> bool:
+        for note in self.notes[-300:]:
+            other = str(note.get("text", ""))
+            if difflib.SequenceMatcher(None, text, other).ratio() >= limit:
+                return True
+        return False
+
     def add_many(self, texts: list[str], period_start: str, period_end: str) -> int:
         next_id = max((int(n.get("id", 0)) for n in self.notes), default=0) + 1
         added = 0
         for text in texts:
             text = text.strip()
             if not text or len(text) > 200:
+                continue
+            if self._too_similar(text):
+                logger.debug("长期记忆重复，跳过：%s", text[:30])
                 continue
             self.notes.append(
                 {
@@ -170,18 +181,19 @@ async def summarize_pending(
         return 0
 
     lines = [
-        f"{item.get('ts', '')[0:16]} {('她' if item.get('role') == 'assistant' else '主人')}: {item.get('content', '')[:200]}"
+        f"{item.get('ts', '')[0:16]} {('她' if item.get('role') == 'assistant' else '浅井昭星')}: {item.get('content', '')[:200]}"
         for item in messages
     ]
-    prompt = f"""以下是「对方.」和「主人」最近的一段对话。请提取值得长期记住的信息，供以后聊天时回忆。
+    prompt = f"""以下是「没有答案.」和「浅井昭星」最近的一段对话。请提取值得长期记住的信息，供以后聊天时回忆。
 
 只提取这些类型：
-- 主人的近况、计划、偏好、重要日期
+- 浅井昭星的近况、计划、偏好、重要日期
 - 两人的约定、承诺、共同事件
 - 关系状态的变化
 - 她自己的近况或情绪（如果明确说了）
 
 要求：
+- 用她自己的口吻写，第一人称，像她自己回忆，例如「他说明天回来 让我去接他」
 - 每条一句话，不超过 60 字
 - 只写对话里明确出现的内容，不推测、不编造
 - 最多 8 条
